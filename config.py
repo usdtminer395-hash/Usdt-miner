@@ -1,9 +1,14 @@
 # Bot configuration file
 
-BOT_TOKEN = "7792716023:AAGMZpWof6HEh_KtSw3iMxF28gN_zfoK8G0"
+import os
+from dotenv import load_dotenv
 
-# USDT (TRC20) Wallet Address for deposits
-WALLET_ADDRESS = "TXRu4QXGhgMtqNF8NaPLSkDU6GPFRnPyA1"
+# Load .env file
+load_dotenv()
+
+# Sensitive data from .env
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 
 # Mining Plans: price and daily profit percentage
 PLANS = {
