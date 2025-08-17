@@ -1,557 +1,483 @@
-import os, json, time, math, logging, io, csv
-import threading
-from uuid import uuid4
-from datetime import datetime
-import requests
-import base58  # For TRON address validation
-
+import os
+import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-load_dotenv()
 
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters, JobQueue
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
 )
 
-# ───────────────── CONFIG ─────────────────
+# ─────────────────── Config ───────────────────
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DEPOSIT_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip()  # TRC-20 USDT address
-TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "").strip()
-USDT_CONTRACT = os.getenv("USDT_CONTRACT", "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj").strip()
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "TPutYourTronUSDTAddress").strip()
+SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "usdtminer395@gmail.com").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8459345615").strip())
 
-PLANS = [10, 50, 100]       # USDT
-DAILY_RATE = 0.04           # 4% / day
-REFERRAL_RATE = 0.10        # 10% on confirmed deposits
-MIN_PROFIT_WITHDRAW = 10.0  # profit withdrawal threshold
-LOCK_DAYS = 15              # principal lock
-DATA_FILE = "data.json"
+PLANS = [10, 50, 100]
+DAILY_RATE = 0.04
+LOCK_DAYS = 15
+MIN_PROFIT_WITHDRAW = 10.0
 
-ADMIN_IDS = {x.strip() for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-
+# ───────── Terms (English; translated from your Urdu text) ─────────
 TERMS_TEXT = (
     "📜 *Terms & Conditions*\n\n"
-    "1) We have taken all possible measures to keep this bot secure. However, in case of any technical fault or any "
-    "other issue that results in financial loss, the bot administration will *not* be held responsible.\n\n"
-    "2) Profit withdrawals: minimum $10 (manual). Requests are processed within 24 hours.\n\n"
-    "3) Investment withdrawal: available *only after 15 days* of lock *and* requires at least *one referral in the same plan*.\n\n"
-    "4) Mining: tap the ⛏ button once every 24 hours to collect *4%* of your *active principal*.\n\n"
-    "5) Deposits must be sent to the TRC-20 USDT address shown inside the bot. Using the wrong network/address may result "
-    "in loss of funds (user’s responsibility).\n\n"
-    "6) Rules may be updated at any time via /terms.\n\n"
-    "By using this bot, you agree to these terms."
+    "*Investment Plans*\n"
+    "You can potentially double your investment in ~20 days and also earn via referrals. "
+    "We currently offer 3 plans: $10, $50 and $100. You can earn up to 4% daily *if you tap* "
+    "the Start Mining button every 24 hours.\n\n"
+    "*Earning Duration*\n"
+    "You keep earning as long as you want and as long as this bot continues to operate. "
+    "Based on our model, we expect long-term operation, but there are no guarantees.\n\n"
+    "*Referral System*\n"
+    "You can earn more than your own investment via referrals. For example, if you refer 1 user who "
+    "invests $100, you get $10 commission immediately (paid by the bot; the investor’s principal remains intact).\n\n"
+    "*Withdraw Rules*\n"
+    f"• Profit or referral commission can be withdrawn any time (minimum ${MIN_PROFIT_WITHDRAW:.0f}).\n"
+    f"• Principal can be withdrawn after *{LOCK_DAYS} days* provided you have *at least one referral in the same plan*.\n\n"
+    "*Note*\n"
+    "We are not responsible for any technical errors, faults, data loss, or any financial loss. "
+    "If for any reason the bot stops or data becomes unavailable, we do not accept liability."
 )
 
-# ──────────────── STORAGE ────────────────
-logging.basicConfig(level=logging.INFO)
+TERMS_ACCEPT_KB = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("✅ Accept Terms", callback_data="accept_terms")]]
+)
 
-DB_LOCK = threading.Lock()
-DB = None
+# ────────────────── Simple in-memory “DB” ──────────────────
+# This is a lightweight placeholder store (per user). Replace with real DB later.
+def ensure_user(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    u = context.user_data
+    if "profile" not in u:
+        u["profile"] = {
+            "terms_accepted": False,
+            "principal": 0.0,              # set real after verifying deposit
+            "plan": None,                  # 10 / 50 / 100
+            "deposit_time": None,          # epoch seconds
+            "referral_count": 0,
+            "referral_same_plan": False,   # at least one same-plan referral
+            "mining_profit": 0.0,          # demo counter
+            "referral_profit": 0.0,        # demo counter
+            "withdrawals": [],             # list of dicts: {id, type, amount, address, status, reason, ts}
+        }
+    return u["profile"]
 
 def now_ts() -> int:
     return int(time.time())
 
-def load_db():
-    with DB_LOCK:
-        if not os.path.exists(DATA_FILE):
-            return {"users": {}, "seen_tx": [], "withdraw_queue": []}
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError as ex:
-            logging.error(f"Corrupted data.json: {ex}")
-            return {"users": {}, "seen_tx": [], "withdraw_queue": []}
+def days_since(ts: int | None) -> int:
+    if not ts:
+        return 0
+    return max(0, int((now_ts() - ts) // 86400))
 
-def save_db():
-    with DB_LOCK:
-        try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(DB, f, ensure_ascii=False, indent=2)
-        except Exception as ex:
-            logging.error(f"Failed to save DB: {ex}")
-
-DB = load_db()
-
-# ──────────────── HELPERS ────────────────
-def is_admin(uid: int) -> bool:
-    return str(uid) in ADMIN_IDS if ADMIN_IDS else False
-
-def fmt_usd(x: float) -> str:
-    return f"${x:,.2f}"
-
-def ensure_user(tg_user):
-    uid = str(tg_user.id)
-    with DB_LOCK:
-        u = DB["users"].get(uid)
-        if u: return u
-        u = {
-            "id": uid,
-            "name": tg_user.full_name,
-            "username": tg_user.username,
-            "created": now_ts(),
-            "referrer": None,
-            "referrals": [],
-            "referrals_by_plan": {},    # {"10": count, ...}
-            "payout": "",
-            "balances": {"profit": 0.0, "referral": 0.0},
-            "investments": [],          # {id, plan, amount, start_ts, lock_until, active, txid}
-            "last_mine": 0,
-            "accepted_terms": False
-        }
-        DB["users"][uid] = u
-        save_db()
-        return u
-
-def active_principal(u) -> float:
-    return sum(inv["amount"] for inv in u["investments"] if inv.get("active", True))
-
-def active_principal_by_plan(u, plan) -> float:
-    return sum(inv["amount"] for inv in u["investments"]
-               if inv.get("active", True) and int(inv["plan"]) == int(plan))
-
-def main_menu():
+# ────────────────── UI Helpers ────────────────
+def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💸 Invest", callback_data="invest"),
-            InlineKeyboardButton("⛏ Start Mining", callback_data="mine")
-        ],
-        [
-            InlineKeyboardButton("💼 Balance", callback_data="balance"),
-            InlineKeyboardButton("👥 Referral", callback_data="ref")
-        ],
-        [
-            InlineKeyboardButton("📤 Withdraw Profit", callback_data="wd_profit"),
-            InlineKeyboardButton("🏦 Withdraw Investment", callback_data="wd_inv")
-        ],
-        [
-            InlineKeyboardButton("⚙️ Payout Address", callback_data="set_addr"),
-            InlineKeyboardButton("📜 Terms", callback_data="terms")
-        ]
+        [InlineKeyboardButton("💸 Invest / Deposit", callback_data="invest"),
+         InlineKeyboardButton("⛏ Start Mining", callback_data="mine")],
+        [InlineKeyboardButton("💼 Balance", callback_data="balance"),
+         InlineKeyboardButton("👥 Referral", callback_data="ref")],
+        [InlineKeyboardButton("💌 Withdraw Profit", callback_data="wd_profit"),
+         InlineKeyboardButton("🏦 Withdraw Investment", callback_data="wd_inv")],
+        [InlineKeyboardButton("📥 Withdraw Status", callback_data="wd_status"),
+         InlineKeyboardButton("⚙️ Payout Address", callback_data="payout")],
+        [InlineKeyboardButton("📜 Terms", callback_data="terms"),
+         InlineKeyboardButton("🛟 Support", callback_data="support")],
     ])
 
-def is_valid_tron_address(address: str) -> bool:
-    try:
-        if len(address) != 34 or not address.startswith("T"):
-            return False
-        base58.b58decode_check(address)
-        return True
-    except Exception:
-        return False
+WELCOME = (
+    "👋 <b>Welcome to USDT Miner Bot!</b>\n"
+    "Please choose an option below:"
+)
 
-def tron_headers():
-    h = {"Accept": "application/json"}
-    if TRONGRID_API_KEY:
-        h["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
-    return h
-
-def fetch_tx(txid: str):
-    try:
-        url = f"https://api.trongrid.io/v1/transactions/{txid}/events"
-        r = requests.get(url, headers=tron_headers(), timeout=20)
-        if r.status_code != 200: return None
-        data = r.json().get("data", [])
-        for e in data:
-            if e.get("event_name") == "Transfer" and e.get("contract_address") == USDT_CONTRACT:
-                fr = e["result"].get("from")
-                to = e["result"].get("to")
-                val = float(e["result"].get("value", 0)) / 1_000_000.0
-                # Check confirmation
-                tx_info_url = f"https://api.trongrid.io/v1/transactions/{txid}"
-                tx_r = requests.get(tx_info_url, headers=tron_headers(), timeout=20)
-                if tx_r.status_code == 200 and tx_r.json().get("confirmed", False):
-                    return {"from": fr, "to": to, "amount": val}
-    except Exception as ex:
-        logging.exception(ex)
-    return None
-
-# ──────────────── HANDLERS ────────────────
+# ────────────────── START / TERMS ──────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = ensure_user(update.effective_user)
-    # Handle referral
-    if context.args and not user.get("referrer"):
-        ref = context.args[0].strip()
-        if ref != user["id"] and ref in DB["users"]:
-            user["referrer"] = ref
-            DB["users"][ref]["referrals"].append(user["id"])
-            save_db()
+    profile = ensure_user(context)
+    if not profile["terms_accepted"]:
+        # Force terms first
+        await update.message.reply_markdown(TERMS_TEXT, reply_markup=TERMS_ACCEPT_KB)
+        return
 
     cover = (
-        "🌟 <b>Welcome! USDT Miner Bot</b> 🌟\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💸 <b>How it works?</b>\n"
-        "• 📈 <b>Plans</b>: $10, $50, $100 (TRC-20 USDT)\n"
-        "• ⛏ <b>Mining</b>: 4% daily profit every 24h\n"
-        "• 👥 <b>Referral Bonus</b>: 10% per deposit\n"
-        "• 💰 <b>Profit Withdrawal</b>: Min $10 (within 24h)\n"
-        "• 🔒 <b>Investment Withdrawal</b>: After 15 days + 1 referral\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🚀 Start growing your investment now!"
+        "• Plans: <b>$10 / $50 / $100</b> (TRC-20)\n"
+        "• Mining: <b>4% daily</b> — tap once every 24h\n"
+        "• Referral: <b>10%</b> per confirmed deposit\n"
+        f"• Profit withdraw: min <b>${MIN_PROFIT_WITHDRAW:.0f}</b> (manual, within 24h)\n"
+        f"• Investment withdraw: after <b>{LOCK_DAYS} days</b> + 1 referral in same plan\n"
+        "────────────────────────"
     )
     await update.message.reply_html(cover, reply_markup=main_menu())
+    await update.message.reply_html(WELCOME, reply_markup=main_menu())
 
 async def cmd_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown(TERMS_TEXT)
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Use the buttons below.", reply_markup=main_menu())
+    profile = ensure_user(context)
+    kb = TERMS_ACCEPT_KB if not profile["terms_accepted"] else main_menu()
+    await update.message.reply_markdown(TERMS_TEXT, reply_markup=kb)
 
 async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user = ensure_user(q.from_user)
+    profile = ensure_user(context)
 
-    if q.data == "terms":
-        await q.edit_message_markdown(TERMS_TEXT, reply_markup=main_menu())
+    # Accept Terms
+    if q.data == "accept_terms":
+        profile["terms_accepted"] = True
+        await q.message.reply_text("✅ You have accepted the Terms & Conditions. You can use the bot now.",
+                                   reply_markup=main_menu())
         return
 
-    if q.data == "balance":
-        txt = (
-            "💼 <b>Your Balance</b> 💼\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 <b>Active Principal</b>: {fmt_usd(active_principal(user))}\n"
-            f"💰 <b>Profit</b>: {fmt_usd(user['balances']['profit'])}\n"
-            f"👥 <b>Referral Bonus</b>: {fmt_usd(user['balances']['referral'])}\n"
-            f"🏦 <b>Payout Address</b>: <code>{user['payout'] or 'Not set'}</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━"
-        )
-        await q.edit_message_html(txt, reply_markup=main_menu())
+    # Gate everything behind terms
+    if not profile["terms_accepted"]:
+        await q.message.reply_text("❌ Please accept Terms & Conditions first.", reply_markup=TERMS_ACCEPT_KB)
         return
 
-    if q.data == "set_addr":
-        context.user_data["await_addr"] = True
-        txt = "⚙️ <b>Set Payout Address</b>\n\nSend your <b>TRC-20 USDT</b> address now."
-        await q.edit_message_html(txt)
-        return
-
+    # Existing buttons (kept same reply_* style)
     if q.data == "invest":
-        plans = "\n".join([f"• 💵 <b>${p}</b>: 4% daily profit" for p in PLANS])
+        plans = "\n".join([f"• ${p} → 4% daily" for p in PLANS])
         txt = (
-            "💸 <b>Invest / Deposit</b> 💸\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📤 <b>Send USDT to this address</b>:\n<code>{DEPOSIT_ADDRESS}</code>\n"
-            "🌐 <b>Network</b>: TRC-20 (TRON)\n\n"
-            f"<b>Plans</b>:\n{plans}\n\n"
-            "<b>How to?</b>\n"
-            "1. Send USDT.\n"
-            "2. Select a plan below.\n"
-            "3. Paste your TXID."
+            "💸 <b>Invest / Deposit</b>\n\n"
+            f"Send USDT (TRC-20) to this address:\n<code>{WALLET_ADDRESS}</code>\n\n"
+            f"{plans}\n\n"
+            "After sending, return here (verification is manual in this demo)."
         )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"💵 ${p}", callback_data=f"plan_{p}") for p in PLANS],
-            [InlineKeyboardButton("🔙 Back", callback_data="back")]
-        ])
-        await q.edit_message_html(txt, reply_markup=kb)
-        return
-
-    if q.data.startswith("plan_"):
-        plan = int(q.data.split("_")[1])
-        context.user_data["await_tx_for_plan"] = plan
-        txt = (
-            f"✅ Selected plan: <b>${plan}</b>\n\n"
-            f"Send to: <code>{DEPOSIT_ADDRESS}</code> (TRC-20)\n"
-            "Now paste your <b>TXID</b> in the chat."
-        )
-        await q.edit_message_html(txt)
+        await q.message.reply_html(txt, reply_markup=main_menu())
         return
 
     if q.data == "mine":
-        last = user.get("last_mine", 0)
-        if now_ts() - last < 24*3600:
-            remain = 24*3600 - (now_ts() - last)
-            hrs = math.ceil(remain / 3600)
-            txt = f"⏳ You've already mined today. Try again in ~{hrs}h. 😊"
-            await q.edit_message_text(txt, reply_markup=main_menu())
-            return
-        principal = active_principal(user)
-        if principal <= 0:
-            txt = "⚠️ No active investment yet. Please invest first. 💸"
-            await q.edit_message_text(txt, reply_markup=main_menu())
-            return
-        gain = round(principal * DAILY_RATE, 2)
-        user["balances"]["profit"] = round(user["balances"]["profit"] + gain, 2)
-        user["last_mine"] = now_ts()
-        save_db()
-        txt = (
-            f"⛏ <b>Mining Successful!</b> 🎉\n"
-            f"💰 Added {fmt_usd(gain)} to your profit!\n"
-            f"📊 Total Profit: {fmt_usd(user['balances']['profit'])}"
+        # demo: bump mining profit a little to simulate daily tap
+        profile["mining_profit"] = round(profile["mining_profit"] + 1.00, 2)
+        await q.message.reply_text(
+            "⛏ Mining started for today. Come back in 24 hours to tap again (demo).",
+            reply_markup=main_menu()
         )
-        await q.edit_message_text(txt, reply_markup=main_menu())
+        return
+
+    if q.data == "balance":
+        dep_days = days_since(profile["deposit_time"])
+        bal_txt = (
+            "💼 <b>Your Balance</b>\n"
+            f"• Active Principal: ${profile['principal']:.2f}\n"
+            f"• Mining Profit: ${profile['mining_profit']:.2f}\n"
+            f"• Referral Profit: ${profile['referral_profit']:.2f}\n"
+            f"• Plan: {profile['plan'] or 'N/A'}\n"
+            f"• Days Since Deposit: {dep_days}\n"
+        )
+        await q.message.reply_html(bal_txt, reply_markup=main_menu())
         return
 
     if q.data == "ref":
-        link = f"https://t.me/{context.bot.username}?start={user['id']}"
-        ref_count = len(user["referrals"])
-        badge = "🥇" if ref_count >= 10 else "🥈" if ref_count >= 5 else "🥉" if ref_count >= 1 else ""
-        txt = (
-            "👥 <b>Referral Program</b> 👥\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• 💎 <b>Bonus</b>: 10% on each deposit\n"
-            f"• 👨‍👩‍👧‍👦 <b>Your Referrals</b>: {ref_count} {badge}\n"
-            f"• 🔗 <b>Your Link</b>:\n<code>{link}</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Invite friends and earn bonuses! 🚀"
-        )
-        await q.edit_message_html(txt, reply_markup=main_menu())
-        return
-
-    if q.data == "wd_profit":
-        amt = user["balances"]["profit"]
-        if amt < MIN_PROFIT_WITHDRAW:
-            txt = f"⚠️ Minimum profit withdrawal is {fmt_usd(MIN_PROFIT_WITHDRAW)}."
-            await q.edit_message_text(txt, reply_markup=main_menu())
-            return
-        if not user["payout"]:
-            txt = "⚠️ Set your payout address first (⚙️ Payout Address)."
-            await q.edit_message_text(txt, reply_markup=main_menu())
-            return
-        req_id = str(uuid4())[:8]
-        DB["withdraw_queue"].append({
-            "id": req_id, "user_id": user["id"], "type": "profit",
-            "amount": round(amt, 2), "to": user["payout"],
-            "status": "pending", "created_ts": now_ts()
-        })
-        user["balances"]["profit"] = 0.0
-        save_db()
-        txt = (
-            f"📤 Profit withdrawal request queued.\n"
-            f"Request ID: <code>{req_id}</code>\n"
-            "Payout will be processed within 24 hours."
-        )
-        await q.edit_message_text(txt, reply_markup=main_menu())
-        return
-
-    if q.data == "wd_inv":
-        lines = ["🏦 <b>Investment Withdrawal Eligibility</b>"]
-        ok_any = False
-        for p in PLANS:
-            principal_plan = active_principal_by_plan(user, p)
-            if principal_plan <= 0:
-                lines.append(f"• ${p}: No active investment")
-                continue
-            ok_lock = any(inv.get("active", True) and int(inv["plan"]) == p and now_ts() >= inv["lock_until"]
-                          for inv in user["investments"])
-            refs_plan = user["referrals_by_plan"].get(str(p), 0)
-            ok_ref = refs_plan >= 1
-            status = "✅" if (ok_lock and ok_ref) else "❌"
-            lock_status = "OK" if ok_lock else "Not yet"
-            ref_status = f"Referral: {refs_plan}/1"
-            lines.append(f"• ${p}: {status} (Lock: {lock_status} | {ref_status})")
-            if ok_lock and ok_ref:
-                ok_any = True
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
-        if ok_any:
-            kb.insert(0, [InlineKeyboardButton("📤 Request Withdrawal", callback_data="req_wd_inv")])
-        await q.edit_message_html("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if q.data == "req_wd_inv":
-        context.user_data["await_inv_withdraw_plan"] = True
-        txt = "Which plan to withdraw? Send: 10 / 50 / 100"
-        await q.edit_message_text(txt)
-        return
-
-    if q.data == "back":
-        txt = "Main menu:"
-        await q.edit_message_text(txt, reply_markup=main_menu())
-        return
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = ensure_user(update.effective_user)
-    txt = update.message.text.strip()
-
-    # Set payout address
-    if context.user_data.get("await_addr"):
-        if not is_valid_tron_address(txt):
-            await update.message.reply_text("⚠️ Invalid TRC-20 address. Please send a valid address.")
-            return
-        user["payout"] = txt
-        context.user_data.pop("await_addr", None)
-        save_db()
-        await update.message.reply_html(
-            f"✅ Payout address saved:\n<code>{txt}</code>",
+        bot_username = (await context.bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start=yourid"
+        await q.message.reply_html(
+            "👥 <b>Referral</b>\n• Bonus: 10%\n"
+            f"• Your link:\n<code>{link}</code>",
             reply_markup=main_menu()
         )
         return
 
-    # Receive TXID after choosing plan
-    if "await_tx_for_plan" in context.user_data:
-        plan = int(context.user_data["await_tx_for_plan"])
-        txid = txt
-        await update.message.reply_text("🔎 Verifying transaction…")
-        info = fetch_tx(txid)
-        if not info:
-            await update.message.reply_text("⚠️ Could not find a valid USDT transfer for this TXID.")
-            return
-        if info["to"] != DEPOSIT_ADDRESS:
-            await update.message.reply_text("⚠️ Funds were not sent to the bot’s deposit address.")
-            return
-        if info["amount"] + 1e-6 < plan:
-            await update.message.reply_text(f"⚠️ Amount is insufficient for the ${plan} plan.")
-            return
-        if txid in DB["seen_tx"]:
-            await update.message.reply_text("⚠️ This TXID was already used.")
-            return
-
-        DB["seen_tx"].append(txid)
-        inv = {
-            "id": str(uuid4()),
-            "plan": plan,
-            "amount": float(plan),
-            "start_ts": now_ts(),
-            "lock_until": now_ts() + LOCK_DAYS*24*3600,
-            "active": True,
-            "txid": txid
-        }
-        user["investments"].append(inv)
-
-        # Referral bonus
-        ref = user.get("referrer")
-        if ref and ref in DB["users"]:
-            ref_u = DB["users"][ref]
-            ref_u["balances"]["referral"] = round(ref_u["balances"]["referral"] + plan * REFERRAL_RATE, 2)
-            ref_u["referrals_by_plan"][str(plan)] = ref_u["referrals_by_plan"].get(str(plan), 0) + 1
-
-        save_db()
-        context.user_data.pop("await_tx_for_plan", None)
-        await update.message.reply_html(
-            f"✅ Investment activated: <b>${plan}</b>\n"
-            f"Lock: <b>{LOCK_DAYS} days</b>\n"
-            f"TXID: <code>{txid}</code>\n\n"
-            "Remember to tap ⛏ <b>Start Mining</b> every 24 hours.",
+    if q.data == "payout":
+        await q.message.reply_html(
+            "⚙️ <b>Payout Address</b>\nSend your TRC-20 USDT address in chat (will be requested during withdrawal).",
             reply_markup=main_menu()
         )
         return
 
-    # Investment withdraw plan
-    if context.user_data.get("await_inv_withdraw_plan"):
-        if txt not in {"10", "50", "100"}:
-            await update.message.reply_text("Please send 10 or 50 or 100.")
-            return
-        plan = int(txt)
-        principal_plan = active_principal_by_plan(user, plan)
-        if principal_plan <= 0:
-            await update.message.reply_text("No active investment in this plan.", reply_markup=main_menu())
-            context.user_data.pop("await_inv_withdraw_plan", None)
-            return
-        ok_lock = any(inv.get("active", True) and int(inv["plan"]) == plan and now_ts() >= inv["lock_until"]
-                      for inv in user["investments"])
-        refs_plan = user["referrals_by_plan"].get(str(plan), 0)
-        ok_ref = refs_plan >= 1
-        if not ok_lock or not ok_ref:
-            await update.message.reply_text("Eligibility not met: 15-day lock + 1 same-plan referral required.",
-                                            reply_markup=main_menu())
-            context.user_data.pop("await_inv_withdraw_plan", None)
-            return
-        if not user["payout"]:
-            await update.message.reply_text("Set your payout address first (⚙️ Payout Address).",
-                                            reply_markup=main_menu())
-            context.user_data.pop("await_inv_withdraw_plan", None)
-            return
+    if q.data == "terms":
+        kb = TERMS_ACCEPT_KB if not profile["terms_accepted"] else main_menu()
+        await q.message.reply_markdown(TERMS_TEXT, reply_markup=kb)
+        return
 
-        # Deactivate investments in this plan
-        for inv in user["investments"]:
-            if inv.get("active", True) and int(inv["plan"]) == plan:
-                inv["active"] = False
-
-        req_id = str(uuid4())[:8]
-        DB["withdraw_queue"].append({
-            "id": req_id, "user_id": user["id"], "type": "principal",
-            "amount": round(principal_plan, 2), "to": user["payout"],
-            "status": "pending", "created_ts": now_ts(), "plan": plan
-        })
-        save_db()
-        context.user_data.pop("await_inv_withdraw_plan", None)
-        await update.message.reply_html(
-            f"📤 Principal withdrawal queued: <b>{fmt_usd(principal_plan)}</b>\n"
-            f"Request ID: <code>{req_id}</code>\nProcessed within 24h.",
+    if q.data == "support":
+        await q.message.reply_html(
+            f"🛟 <b>Support</b>\nEmail: <code>{SUPPORT_EMAIL}</code>\n"
+            f"<a href='mailto:{SUPPORT_EMAIL}'>Open mail app</a>",
             reply_markup=main_menu()
         )
         return
 
-    # Fallback
-    await update.message.reply_text("Use the menu below.", reply_markup=main_menu())
-
-# ──────────────── ADMIN ────────────────
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only.")
+    if q.data == "website":
+        await q.message.reply_text("🌐 Website: coming soon.", reply_markup=main_menu())
         return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Queue", callback_data="ad_queue"),
-         InlineKeyboardButton("📤 Export CSV", callback_data="ad_export")]
-    ])
-    await update.message.reply_text("Admin Panel:", reply_markup=kb)
 
-async def on_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if q.data == "wd_status":
+        await show_withdraw_status(q, context, profile)
+        return
+
+# ────────────────── Withdraw Flow ──────────────────
+# Conversation states
+ASK_AMOUNT, ASK_ADDRESS = range(2)
+
+async def withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry via callback: wd_profit or wd_inv"""
     q = update.callback_query
-    if not is_admin(q.from_user.id):
-        await q.answer("Admin only", show_alert=True)
-        return
     await q.answer()
+    profile = ensure_user(context)
 
-    if q.data == "ad_queue":
-        rows = [r for r in DB.get("withdraw_queue", []) if r["status"] == "pending"]
-        if not rows:
-            await q.edit_message_text("Queue is empty.")
+    if not profile["terms_accepted"]:
+        await q.message.reply_text("❌ Please accept Terms & Conditions first.", reply_markup=TERMS_ACCEPT_KB)
+        return ConversationHandler.END
+
+    wtype = "profit" if q.data == "wd_profit" else "principal"
+    context.user_data["wd_flow"] = {"type": wtype}
+
+    title = "💌 Withdraw Profit" if wtype == "profit" else "🏦 Withdraw Investment"
+    await q.message.reply_text(f"{title}\n\nPlease enter the *amount in USDT* you want to withdraw:",
+                               reply_markup=main_menu(), parse_mode="Markdown")
+    return ASK_AMOUNT
+
+async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    profile = ensure_user(context)
+    text = (update.message.text or "").strip()
+    try:
+        amt = float(text)
+    except Exception:
+        await update.message.reply_text("❗ Please send a valid number (e.g., 12.5).")
+        return ASK_AMOUNT
+
+    if amt <= 0:
+        await update.message.reply_text("❗ Amount must be greater than 0.")
+        return ASK_AMOUNT
+
+    context.user_data["wd_flow"]["amount"] = round(amt, 2)
+    await update.message.reply_text("Great. Now send your *TRC-20 USDT address*:",
+                                    parse_mode="Markdown")
+    return ASK_ADDRESS
+
+async def withdraw_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    profile = ensure_user(context)
+    addr = (update.message.text or "").strip()
+
+    if len(addr) < 30:  # very loose check for TRON address length
+        await update.message.reply_text("❗ That doesn't look like a valid TRC-20 address. Please send again.")
+        return ASK_ADDRESS
+
+    flow = context.user_data.get("wd_flow", {})
+    wtype = flow.get("type")
+    amount = flow.get("amount")
+
+    # Validate request
+    status = "UNDER_PROCESS"
+    reason = ""
+
+    if wtype == "profit":
+        # Must meet minimum
+        if amount < MIN_PROFIT_WITHDRAW:
+            status = "REJECTED"
+            reason = f"Minimum profit withdrawal is ${MIN_PROFIT_WITHDRAW:.0f}."
+        # Must not exceed available profit (demo: mining + referral)
+        available = round(profile["mining_profit"] + profile["referral_profit"], 2)
+        if status == "UNDER_PROCESS" and amount > available:
+            status = "REJECTED"
+            reason = f"Requested ${amount:.2f} exceeds available profit ${available:.2f}."
+
+    elif wtype == "principal":
+        # Must have principal
+        if profile["principal"] <= 0:
+            status = "REJECTED"
+            reason = "No active principal found."
+        # Must be >= 15 days + at least one referral in same plan
+        dep_days = days_since(profile["deposit_time"])
+        if status == "UNDER_PROCESS" and dep_days < LOCK_DAYS:
+            status = "REJECTED"
+            reason = f"Principal locked for {LOCK_DAYS} days. Only {dep_days} days passed."
+        if status == "UNDER_PROCESS" and not profile["referral_same_plan"]:
+            status = "REJECTED"
+            reason = "At least one referral in the same plan is required."
+
+        # Amount must not exceed principal
+        if status == "UNDER_PROCESS" and amount > profile["principal"]:
+            status = "REJECTED"
+            reason = f"Requested ${amount:.2f} exceeds principal ${profile['principal']:.2f}."
+
+    # Create request record
+    req_id = f"WD{int(time.time()*1000)}"
+    record = {
+        "id": req_id,
+        "type": wtype,
+        "amount": round(amount, 2),
+        "address": addr,
+        "status": status,           # UNDER_PROCESS / APPROVED / REJECTED
+        "reason": reason,
+        "ts": now_ts(),
+    }
+    profile["withdrawals"].append(record)
+
+    # Notify user
+    if status == "REJECTED":
+        await update.message.reply_text(
+            f"❌ Withdrawal request *rejected*.\nReason: {reason}\n\nID: {req_id}",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Withdrawal request *submitted*.\nStatus: UNDER_PROCESS\n\nID: {req_id}",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    # Notify Admin with full details
+    await notify_admin_withdraw(update, context, profile, record)
+
+    # Cleanup flow
+    context.user_data.pop("wd_flow", None)
+    return ConversationHandler.END
+
+async def notify_admin_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE, profile: dict, record: dict):
+    u = update.effective_user
+    dep_days = days_since(profile["deposit_time"])
+    available_profit = round(profile["mining_profit"] + profile["referral_profit"], 2)
+    plan_txt = profile["plan"] or "N/A"
+
+    msg = (
+        "📥 *Withdraw Request*\n"
+        f"*ID:* `{record['id']}`\n"
+        f"*Type:* {record['type'].upper()}\n"
+        f"*Amount:* ${record['amount']:.2f}\n"
+        f"*Address:* `{record['address']}`\n"
+        f"*Status:* {record['status']}\n"
+        f"*Reason:* {record['reason'] or '-'}\n"
+        "────────────────────\n"
+        "*User Info*\n"
+        f"• ID: `{u.id}`\n"
+        f"• Name: {u.full_name}\n"
+        f"• Username: @{u.username if u.username else 'N/A'}\n"
+        "────────────────────\n"
+        "*Account Snapshot*\n"
+        f"• Principal: ${profile['principal']:.2f}\n"
+        f"• Plan: {plan_txt}\n"
+        f"• Days Since Deposit: {dep_days}\n"
+        f"• Mining Profit: ${profile['mining_profit']:.2f}\n"
+        f"• Referral Profit: ${profile['referral_profit']:.2f}\n"
+        f"• Available Profit: ${available_profit:.2f}\n"
+        f"• Referral Count: {profile['referral_count']}\n"
+        f"• Same-plan Referral: {profile['referral_same_plan']}\n"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="Markdown")
+    except Exception:
+        # swallow admin DM errors
+        pass
+
+async def show_withdraw_status(q, context: ContextTypes.DEFAULT_TYPE, profile: dict):
+    if not profile["withdrawals"]:
+        await q.message.reply_text("📥 You have no withdrawal requests yet.", reply_markup=main_menu())
+        return
+    lines = []
+    for r in sorted(profile["withdrawals"], key=lambda x: x["ts"], reverse=True)[:10]:
+        dt = datetime.fromtimestamp(r["ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines.append(
+            f"• {r['id']} — {r['type'].upper()} ${r['amount']:.2f}\n"
+            f"  Address: {r['address']}\n"
+            f"  Status: {r['status']}{' — ' + r['reason'] if r['reason'] else ''}\n"
+            f"  Time: {dt}"
+        )
+    await q.message.reply_text("📥 *Your Withdrawal Requests:*\n\n" + "\n\n".join(lines),
+                               parse_mode="Markdown", reply_markup=main_menu())
+
+# ────────────────── Simple admin actions (optional) ──────────────────
+# For demo convenience, you can approve/reject last UNDER_PROCESS from chat (admin only).
+async def cmd_admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    # Approve last UNDER_PROCESS for that user id passed as /approve <user_id> <req_id>
+    try:
+        _, user_id_str, req_id = (update.message.text or "").split(maxsplit=2)
+        user_id = int(user_id_str)
+    except Exception:
+        await update.message.reply_text("Usage: /approve <user_id> <request_id>")
+        return
+    ud = context.application.user_data.get(user_id, {})
+    profile = ud.get("profile")
+    if not profile:
+        await update.message.reply_text("User/profile not found.")
+        return
+    for r in profile["withdrawals"]:
+        if r["id"] == req_id:
+            r["status"] = "APPROVED"
+            r["reason"] = ""
+            await update.message.reply_text(f"Approved {req_id}.")
+            try:
+                await context.bot.send_message(chat_id=user_id, text=f"✅ Your withdraw {req_id} has been *APPROVED*.",
+                                               parse_mode="Markdown")
+            except Exception:
+                pass
             return
-        lines = ["Pending Requests:"]
-        for r in rows[:50]:
-            created = datetime.utcfromtimestamp(r['created_ts']).strftime('%Y-%m-%d %H:%M:%S')
-            lines.append(f"{r['id']} | {r['type']} | {fmt_usd(r['amount'])} → {r['to']} "
-                         f"(user {r['user_id']}) | {created} UTC")
-        await q.edit_message_text("\n".join(lines))
+    await update.message.reply_text("Request not found.")
+
+async def cmd_admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         return
-
-    if q.data == "ad_export":
-        rows = DB.get("withdraw_queue", [])
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["id","user_id","type","amount","to","status","created_ts","plan"])
-        for r in rows:
-            w.writerow([r.get("id"), r.get("user_id"), r.get("type"), r.get("amount"),
-                        r.get("to"), r.get("status"), r.get("created_ts"), r.get("plan")])
-        data = buf.getvalue().encode("utf-8")
-        await q.message.reply_document(document=data, filename="withdraw_queue.csv",
-                                       caption="Withdraw Queue CSV")
-        await q.edit_message_text("CSV sent.")
+    try:
+        _, user_id_str, req_id, *reason_parts = (update.message.text or "").split()
+        user_id = int(user_id_str)
+        reason = " ".join(reason_parts) if reason_parts else "Rejected by admin."
+    except Exception:
+        await update.message.reply_text("Usage: /reject <user_id> <request_id> [reason]")
         return
+    ud = context.application.user_data.get(user_id, {})
+    profile = ud.get("profile")
+    if not profile:
+        await update.message.reply_text("User/profile not found.")
+        return
+    for r in profile["withdrawals"]:
+        if r["id"] == req_id:
+            r["status"] = "REJECTED"
+            r["reason"] = reason
+            await update.message.reply_text(f"Rejected {req_id}.")
+            try:
+                await context.bot.send_message(chat_id=user_id,
+                                               text=f"❌ Your withdraw {req_id} has been *REJECTED*.\nReason: {reason}",
+                                               parse_mode="Markdown")
+            except Exception:
+                pass
+            return
+    await update.message.reply_text("Request not found.")
 
-# ──────────────── REMINDER JOB ────────────────
-async def mine_reminder(context: ContextTypes.DEFAULT_TYPE):
-    with DB_LOCK:
-        for uid, user in DB["users"].items():
-            if active_principal(user) > 0 and now_ts() - user.get("last_mine", 0) >= 24*3600:
-                txt = "⛏ It's time to mine! Tap ⛏ Start Mining now! 😊"
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=txt,
-                    reply_markup=main_menu()
-                )
-
-# ──────────────── BOOTSTRAP ────────────────
+# ────────────────── Bootstrap ────────────────
 def main():
-    if not BOT_TOKEN or not DEPOSIT_ADDRESS or not USDT_CONTRACT:
-        raise RuntimeError("Missing required env vars: BOT_TOKEN, WALLET_ADDRESS, USDT_CONTRACT")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN missing. Set it in .env")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("terms", cmd_terms))
+    app.add_handler(CommandHandler("approve", cmd_admin_approve))
+    app.add_handler(CommandHandler("reject", cmd_admin_reject))
 
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CallbackQueryHandler(on_admin_buttons, pattern="^ad_"))
+    # Withdraw conversation (for both profit & principal)
+    wd_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(withdraw_entry, pattern="^(wd_profit|wd_inv)$"),
+        ],
+        states={
+            ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount)],
+            ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_address)],
+        },
+        fallbacks=[],
+        per_chat=True,
+        per_user=True,
+        per_message=True,  # so callback works reliably
+    )
+    app.add_handler(wd_conv)
 
+    # Other buttons
     app.add_handler(CallbackQueryHandler(on_buttons))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Job queue for reminders (every hour)
-    app.job_queue.run_repeating(mine_reminder, interval=3600, first=10)
-
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
